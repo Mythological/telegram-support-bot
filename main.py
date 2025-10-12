@@ -1,140 +1,164 @@
+"""
+Этот файл содержит код для Telegram-бота поддержки, написанного с использованием библиотеки aiogram.
+Для запуска установите переменные окружения:
+- BOT_TOKEN: Ваш токен Telegram-бота.
+- ADMIN_CHAT_ID: ID чата/группы для администраторов.
+"""
 import os
 import json
 import logging
+import asyncio
 import datetime
 from datetime import timedelta, timezone
-from aiogram import Bot, Dispatcher, types, F
+from typing import Tuple, List, Optional, Dict, Any, Callable, Awaitable, Union
+
+from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.utils.markdown import hbold
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from aiogram.filters.callback_data import CallbackData
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery, TelegramObject
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramAPIError
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
+
 
 # --- Конфигурация ---
-# Замените на ваш токен
-BOT_TOKEN = "токен"
-# Группа администрации, нужно будет выдать админку боту
-ADMIN_CHAT_ID = "айди группы"
-PAGE_SIZE = 10
+class Config:
+    """Класс для хранения конфигурации бота из переменных окружения."""
+    def __init__(self):
+        self.bot_token = os.getenv("BOT_TOKEN")
+        admin_chat_id_str = os.getenv("ADMIN_CHAT_ID")
 
-# Настройка логирования
+        if not self.bot_token:
+            raise ValueError("Необходимо установить переменную окружения BOT_TOKEN.")
+        if not admin_chat_id_str or not admin_chat_id_str.replace('-', '').isdigit():
+            raise ValueError("Переменная окружения ADMIN_CHAT_ID не установлена или имеет неверный формат.")
+
+        self.admin_chat_id = int(admin_chat_id_str)
+        self.page_size = 10
+
+        self.bot_dir = os.path.dirname(os.path.abspath(__file__))
+        self.meta_dir = os.path.join(self.bot_dir, 'meta')
+        os.makedirs(self.meta_dir, exist_ok=True)
+
+        self.users_data_file = os.path.join(self.meta_dir, 'users_data.json')
+        self.messages_mapping_file = os.path.join(self.meta_dir, 'messages_mapping.json')
+        self.log_file = os.path.join(self.meta_dir, 'admin_log.txt')
+        self.messages_file = os.path.join(self.bot_dir, 'messages.json')
+
+
+# --- Управление данными ---
+class DataManager:
+    """Класс для атомарного чтения и записи данных в JSON-файл."""
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self._data = self._load()
+
+    def _load(self) -> dict:
+        if not os.path.exists(self.file_path):
+            self._save({})
+            return {}
+        try:
+            with open(self.file_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return {}
+
+    def _save(self, data: Optional[Dict] = None):
+        with open(self.file_path, 'w', encoding='utf-8') as f:
+            json.dump(data if data is not None else self._data, f, indent=4, ensure_ascii=False)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        return self._data.get(str(key), default)
+
+    def set(self, key: Any, value: Any):
+        self._data[str(key)] = value
+        self._save()
+
+    def delete(self, key: Any):
+        if str(key) in self._data:
+            del self._data[str(key)]
+            self._save()
+
+    def items(self):
+        return self._data.items()
+
+    def values(self):
+        return self._data.values()
+
+    def __contains__(self, key: Any) -> bool:
+        return str(key) in self._data
+
+
+# --- Инициализация ---
+try:
+    config = Config()
+except ValueError as e:
+    logging.critical(e)
+    exit(1)
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Определение путей
-BOT_DIR = os.path.dirname(os.path.abspath(__file__))
-META_DIR = os.path.join(BOT_DIR, 'meta')
-
-# Создание директории meta
-os.makedirs(META_DIR, exist_ok=True)
-
-# Пути к файлам данных
-USERS_DATA_FILE = os.path.join(META_DIR, 'users_data.json')
-MESSAGES_MAPPING_FILE = os.path.join(META_DIR, 'messages_mapping.json')
-REPLY_MAPPING_FILE = os.path.join(META_DIR, 'reply_mapping.json')
-LOG_FILE_NAME = os.path.join(META_DIR, 'admin_log.txt')
-MESSAGES_FILE = os.path.join(BOT_DIR, 'messages.json')
-
-
-# --- Утилиты для работы с данными ---
-
-def load_data(file_path: str) -> dict:
-    """Загружает данные из JSON-файла."""
-    if not os.path.exists(file_path):
-        return {}
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
-        return {}
-
-
-def save_data(file_path: str, data: dict):
-    """Сохраняет данные в JSON-файл."""
-    with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-
-
+users_data = DataManager(config.users_data_file)
+messages_mapping = DataManager(config.messages_mapping_file)
 try:
-    MESSAGES = load_data(MESSAGES_FILE)
-    if not MESSAGES:
-        logger.warning(f"Файл сообщений '{MESSAGES_FILE}' пуст или не найден. Используются значения по умолчанию.")
-except Exception as e:
-    logger.error(f"Ошибка при загрузке файла сообщений: {e}")
+    with open(config.messages_file, 'r', encoding='utf-8') as f:
+        MESSAGES = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    logger.warning(f"Файл сообщений '{config.messages_file}' не найден. Используются значения по умолчанию.")
     MESSAGES = {}
 
+last_cleanup_time = datetime.datetime.fromtimestamp(0)
 
-def log_admin_action(admin_id, action_type, details):
-    """Логирование действий администратора."""
+
+# --- Фабрика CallbackData ---
+class BanlistCallback(CallbackData, prefix="banlist"):
+    """CallbackData для пагинации списка заблокированных."""
+    page: int
+
+
+# --- Утилиты ---
+def log_admin_action(admin_id: int, action: str, details: str):
+    """Логирует действия администратора в файл."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = f"[{timestamp}] Admin ID: {admin_id} | Action: {action_type} | Details: {details}\n"
-    with open(LOG_FILE_NAME, 'a', encoding='utf-8') as f:
-        f.write(log_entry)
-
-
-# --- Утилиты для работы с датой и временем ---
+    log_entry = f"[{timestamp}] Admin ID: {admin_id} | Action: {action} | Details: {details}\n"
+    try:
+        with open(config.log_file, 'a', encoding='utf-8') as f:
+            f.write(log_entry)
+    except IOError as e:
+        logger.error(f"Ошибка записи в лог-файл: {e}")
 
 def get_russian_month(month_number: int) -> str:
-    """Возвращает название месяца на русском языке."""
-    months = {
-        1: 'января', 2: 'февраля', 3: 'марта', 4: 'апреля',
-        5: 'мая', 6: 'июня', 7: 'июля', 8: 'августа',
-        9: 'сентября', 10: 'октября', 11: 'ноября', 12: 'декабря'
-    }
+    """Возвращает название месяца на русском языке в родительном падеже."""
+    months = {1: 'января', 2: 'февраля', 3: 'марта', 4: 'апреля', 5: 'мая', 6: 'июня', 7: 'июля', 8: 'августа', 9: 'сентября', 10: 'октября', 11: 'ноября', 12: 'декабря'}
     return months.get(month_number, '')
 
-
 def format_datetime_for_message(dt_obj: datetime.datetime) -> str:
-    """Форматирует объект datetime в строку для сообщения (по МСК)."""
+    """Форматирует datetime в удобную для чтения строку (по МСК)."""
+    if dt_obj == datetime.datetime.max:
+        return "навсегда"
     moscow_tz = timezone(timedelta(hours=3))
     dt_moscow = dt_obj.astimezone(moscow_tz)
-    return f"{dt_moscow.day} {get_russian_month(dt_moscow.month)} {dt_moscow.year} в {dt_moscow.hour:02}:{dt_moscow.minute:02} (по мск)"
+    return f"{dt_moscow.day} {get_russian_month(dt_moscow.month)} {dt_moscow.year} в {dt_moscow.strftime('%H:%M')} (мск)"
 
-
-# --- Основная логика бота ---
-
-def cleanup_old_messages():
-    """Удаляет старые сообщения (старше 30 дней) из файла-отображения."""
-    messages_mapping = load_data(MESSAGES_MAPPING_FILE)
+def cleanup_old_messages_if_needed():
+    """Удаляет старые сообщения (старше 30 дней), если с последней очистки прошел час."""
+    global last_cleanup_time
+    if datetime.datetime.now() - last_cleanup_time < timedelta(hours=1):
+        return
+    
     thirty_days_ago = datetime.datetime.now() - timedelta(days=30)
+    # Создаем новый словарь, чтобы избежать изменения во время итерации
+    new_mapping_data = {msg_id: data for msg_id, data in messages_mapping.items() 
+                        if datetime.datetime.fromtimestamp(data.get('timestamp', 0)) > thirty_days_ago}
+    
+    if len(new_mapping_data) < len(messages_mapping._data):
+        messages_mapping._data = new_mapping_data
+        messages_mapping._save()
+        logger.info(f"Очистка: удалено {len(messages_mapping._data) - len(new_mapping_data)} старых записей.")
 
-    # Используем dict comprehension для большей эффективности
-    new_mapping = {
-        user_msg_id: data
-        for user_msg_id, data in messages_mapping.items()
-        if datetime.datetime.fromtimestamp(data.get('timestamp', 0)) > thirty_days_ago
-    }
-    save_data(MESSAGES_MAPPING_FILE, new_mapping)
-
-
-def is_user_banned(user_id: int) -> (bool, str | None):
-    """
-    Проверяет, заблокирован ли пользователь.
-    Также снимает блокировку, если ее срок истек (побочный эффект).
-    """
-    users_data = load_data(USERS_DATA_FILE)
-    user_id_str = str(user_id)
-
-    if user_id_str in users_data and 'banned_until' in users_data[user_id_str]:
-        ban_end_time_str = users_data[user_id_str]['banned_until']
-
-        if ban_end_time_str == datetime.datetime.max.isoformat():
-            return True, "навсегда"
-
-        ban_end_time = datetime.datetime.fromisoformat(ban_end_time_str)
-
-        if ban_end_time > datetime.datetime.now():
-            return True, format_datetime_for_message(ban_end_time)
-        else:
-            # Срок бана истек, снимаем бан
-            del users_data[user_id_str]['banned_until']
-            if 'ban_reason' in users_data[user_id_str]:
-                del users_data[user_id_str]['ban_reason']
-            save_data(USERS_DATA_FILE, users_data)
-
-    return False, None
-
+    last_cleanup_time = datetime.datetime.now()
 
 async def is_admin(user_id: int, chat_id: int, bot: Bot) -> bool:
     """Проверяет, является ли пользователь администратором чата."""
@@ -142,467 +166,372 @@ async def is_admin(user_id: int, chat_id: int, bot: Bot) -> bool:
         admins = await bot.get_chat_administrators(chat_id)
         return any(admin.user.id == user_id for admin in admins)
     except TelegramAPIError as e:
-        logger.error(f"Ошибка при проверке статуса администратора: {e}")
+        logger.error(f"Ошибка при проверке статуса администратора для user_id {user_id}: {e}")
         return False
 
+def check_ban_status_and_unban_if_expired(user_id: int) -> Tuple[bool, Optional[str]]:
+    """Проверяет бан пользователя. Если срок истек, снимает его."""
+    user = users_data.get(user_id)
+    if not user or 'banned_until' not in user:
+        return False, None
 
-# --- Обработчики команд ---
+    ban_end_time_str = user['banned_until']
+    ban_end_time = datetime.datetime.fromisoformat(ban_end_time_str)
 
+    if ban_end_time > datetime.datetime.now():
+        return True, format_datetime_for_message(ban_end_time)
+    else:
+        del user['banned_until']
+        if 'ban_reason' in user: del user['ban_reason']
+        users_data.set(user_id, user)
+        logger.info(f"С пользователя {user_id} снят бан по истечении срока.")
+        return False, None
+
+def _parse_ban_args(args: List[str]) -> Tuple[Optional[timedelta], Optional[str]]:
+    """Парсит аргументы для команды бана, извлекая длительность и причину."""
+    if not args: return None, None
+    
+    duration_str = args[0]
+    reason_args = args[1:]
+    duration = None
+    
+    if len(duration_str) > 1 and duration_str[:-1].isdigit():
+        value = int(duration_str[:-1])
+        unit = duration_str[-1].lower()
+        if unit in ['y', 'г']: duration = timedelta(days=value * 365)
+        elif unit in ['w', 'н']: duration = timedelta(weeks=value)
+        elif unit in ['d', 'д']: duration = timedelta(days=value)
+        elif unit in ['h', 'ч']: duration = timedelta(hours=value)
+        elif unit in ['m', 'м']: duration = timedelta(minutes=value)
+        else: reason_args.insert(0, duration_str)
+    else:
+        reason_args.insert(0, duration_str)
+        
+    reason = ' '.join(reason_args) if reason_args else None
+    return duration, reason
+
+async def _get_target_id_from_context(message: Message) -> Tuple[Optional[int], List[str]]:
+    """Извлекает ID цели и остальные аргументы из контекста сообщения."""
+    command_args = message.text.split()[1:]
+    target_id = None
+    remaining_args = command_args
+
+    if message.reply_to_message:
+        mapping = messages_mapping.get(message.reply_to_message.message_id)
+        if mapping:
+            target_id = mapping.get('user_id')
+    elif command_args and command_args[0].isdigit():
+        target_id = int(command_args[0])
+        remaining_args = command_args[1:]
+        
+    return target_id, remaining_args
+
+
+# --- Клавиатуры ---
+def _get_pagination_keyboard(page: int, total_pages: int) -> Optional[InlineKeyboardMarkup]:
+    """Создает клавиатуру для пагинации."""
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton(text="<< Назад", callback_data=BanlistCallback(page=page - 1).pack()))
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton(text="Вперед >>", callback_data=BanlistCallback(page=page + 1).pack()))
+    
+    return InlineKeyboardMarkup(inline_keyboard=[buttons]) if buttons else None
+
+
+# --- Роутеры и обработчики ---
+admin_router = Router()
+user_router = Router()
+
+# Фильтр для всех админских хендлеров
+admin_router.message.filter(F.chat.id == config.admin_chat_id)
+admin_router.callback_query.filter(F.chat.id == config.admin_chat_id)
+
+
+@user_router.message(CommandStart())
 async def start_command(message: Message):
-    """Обрабатывает команду /start."""
-    user_id = str(message.chat.id)
-    if is_user_banned(int(user_id))[0]:
-        return
+    """Обработчик команды /start."""
+    user_id = message.chat.id
+    if check_ban_status_and_unban_if_expired(user_id)[0]: return
 
-    users_data = load_data(USERS_DATA_FILE)
     now = datetime.datetime.now()
-
     if user_id not in users_data:
-        users_data[user_id] = {
+        users_data.set(user_id, {
             'first_launch': now.isoformat(),
             'total_messages': 0,
-            'monthly_messages': 0,
-            'weekly_messages': 0,
             'last_message_date': now.isoformat(),
             'username': message.from_user.username if message.from_user else "unknown"
-        }
-        save_data(USERS_DATA_FILE, users_data)
-        await message.reply(MESSAGES.get("welcome_user", "Привет!"))
+        })
+        await message.reply(MESSAGES.get("welcome_user", "Здравствуйте! Отправьте ваше сообщение, и администратор скоро ответит."))
     else:
-        first_launch_dt = datetime.datetime.fromisoformat(users_data[user_id]['first_launch'])
-        formatted_date = format_datetime_for_message(first_launch_dt)
-        await message.reply(
-            MESSAGES.get("already_started", "С возвращением! Вы с нами с {formatted_date}.").format(
-                formatted_date=formatted_date))
+        user = users_data.get(user_id)
+        first_launch_dt = datetime.datetime.fromisoformat(user['first_launch'])
+        await message.reply(MESSAGES.get("already_started", "С возвращением! Вы с нами с {date}.").format(date=format_datetime_for_message(first_launch_dt)))
 
-
+@user_router.message(Command("help"))
 async def help_command(message: Message):
-    """Обрабатывает команду /help."""
-    await message.reply(MESSAGES.get("help_message", "Это бот для связи с администратором."))
+    """Обработчик команды /help."""
+    await message.reply(MESSAGES.get("help_message", "Просто отправьте ваше сообщение в этот чат."))
 
 
+@admin_router.message(Command("msg"))
 async def msg_admin_command(message: Message, bot: Bot):
-    """Обрабатывает команду /msg для отправки сообщения пользователю."""
-    if not await is_admin(message.from_user.id, ADMIN_CHAT_ID, bot):
-        return
-
+    """Отправка сообщения пользователю от имени бота."""
     args = message.text.split(maxsplit=2)
-    if len(args) < 3:
+    if len(args) < 3 or not args[1].isdigit():
         await message.reply(MESSAGES.get("msg_usage", "Использование: /msg <user_id> <текст>"))
         return
 
-    _, user_id_to_send, text_to_send = args
-
-    if not user_id_to_send.isdigit():
-        await message.reply(MESSAGES.get("id_not_numeric", "ID пользователя должен быть числом."))
-        return
-
+    _, user_id_str, text = args
     try:
-        await bot.send_message(user_id_to_send, text_to_send)
-        await message.reply(
-            MESSAGES.get("msg_sent_success", "Сообщение отправлено пользователю {user_id_to_send}.").format(
-                user_id_to_send=user_id_to_send))
-        log_admin_action(message.from_user.id, "SEND_MSG",
-                         f"To user {user_id_to_send}: '{text_to_send[:50]}...'")
+        await bot.send_message(int(user_id_str), text)
+        await message.reply(MESSAGES.get("msg_sent_success", "Сообщение пользователю {user_id} отправлено.").format(user_id=user_id_str))
+        log_admin_action(message.from_user.id, "SEND_MSG", f"To user {user_id_str}")
     except TelegramAPIError as e:
         await message.reply(MESSAGES.get("msg_send_error", "Ошибка при отправке: {error}").format(error=e))
 
 
-async def who_admin_command(message: Message, bot: Bot):
-    """Обрабатывает команду /who для получения информации о пользователе."""
-    if not await is_admin(message.from_user.id, ADMIN_CHAT_ID, bot):
-        return
-
-    target_user_id = None
-    if message.reply_to_message:
-        messages_mapping = load_data(MESSAGES_MAPPING_FILE)
-        target_user_id = messages_mapping.get(str(message.reply_to_message.message_id), {}).get('user_id')
-    elif len(message.text.split()) > 1:
-        target_user_id = message.text.split()[1]
-
+@admin_router.message(Command("who"))
+async def who_admin_command(message: Message):
+    """Получение информации о пользователе."""
+    target_user_id, _ = await _get_target_id_from_context(message)
     if not target_user_id:
-        await message.reply(
-            MESSAGES.get("who_usage", "Использование: /who <user_id> или ответьте на сообщение пользователя."))
+        await message.reply(MESSAGES.get("who_usage", "Использование: /who <user_id> или ответом на сообщение."))
         return
 
-    users_data = load_data(USERS_DATA_FILE)
-    user_info = users_data.get(str(target_user_id))
-
-    if user_info:
-        first_launch_dt = datetime.datetime.fromisoformat(user_info['first_launch'])
-        formatted_date = format_datetime_for_message(first_launch_dt)
-        username_info = f"@{user_info['username']}" if 'username' in user_info else "не указан"
-
-        text = MESSAGES.get("user_info_template",
-                            "ID: {user_id}\nUsername: {username_info}\nПервый запуск: {formatted_date}").format(
-            user_id=target_user_id,
-            username_info=username_info,
-            formatted_date=formatted_date
-        )
-        await message.reply(text, parse_mode='HTML')
-        log_admin_action(message.from_user.id, "GET_USER_INFO", f"For user {target_user_id}")
-    else:
-        await message.reply(MESSAGES.get("user_not_found", "Пользователь не найден."))
-
-
-async def stats_admin_command(message: Message, bot: Bot):
-    """Обрабатывает команду /stats для получения статистики."""
-    if not await is_admin(message.from_user.id, ADMIN_CHAT_ID, bot):
+    user_info = users_data.get(target_user_id)
+    if not user_info:
+        await message.reply(MESSAGES.get("user_not_found", "Пользователь не найден в базе данных."))
         return
 
-    users_data = load_data(USERS_DATA_FILE)
-    total_messages = sum(user.get('total_messages', 0) for user in users_data.values())
+    first_launch_dt = datetime.datetime.fromisoformat(user_info['first_launch'])
+    text = MESSAGES.get("user_info_template", 
+                        "ID: <code>{id}</code>\nUsername: @{uname}\nПервый запуск: {date}").format(
+                            id=target_user_id, 
+                            uname=user_info.get('username', 'н/у'), 
+                            date=format_datetime_for_message(first_launch_dt)
+                        )
+    await message.reply(text)
+    log_admin_action(message.from_user.id, "GET_USER_INFO", f"For user {target_user_id}")
 
+
+@admin_router.message(Command("stats"))
+async def stats_admin_command(message: Message):
+    """Получение статистики по боту."""
     now = datetime.datetime.now()
-    one_month_ago = now - timedelta(days=30)
-    one_week_ago = now - timedelta(days=7)
+    all_users = list(users_data.values())
+    
+    active_weekly = sum(1 for u in all_users if 'last_message_date' in u and now - datetime.datetime.fromisoformat(u['last_message_date']) < timedelta(days=7))
+    active_monthly = sum(1 for u in all_users if 'last_message_date' in u and now - datetime.datetime.fromisoformat(u['last_message_date']) < timedelta(days=30))
+    total_messages = sum(u.get('total_messages', 0) for u in all_users)
 
-    monthly_messages = 0
-    weekly_messages = 0
-
-    for user in users_data.values():
-        last_message_date_str = user.get('last_message_date')
-        if last_message_date_str:
-            last_message_date = datetime.datetime.fromisoformat(last_message_date_str)
-            if last_message_date > one_month_ago:
-                monthly_messages += user.get('monthly_messages', 0)
-            if last_message_date > one_week_ago:
-                weekly_messages += user.get('weekly_messages', 0)
-
-    text = MESSAGES.get("stats_template",
-                        "📊 <b>Статистика бота</b>\n\nВсего сообщений: {total_messages}\nСообщений за месяц: {monthly_messages}\nСообщений за неделю: {weekly_messages}").format(
-        total_messages=total_messages,
-        monthly_messages=monthly_messages,
-        weekly_messages=weekly_messages
-    )
+    text = MESSAGES.get("stats_template", 
+                        ("📊 <b>Статистика бота</b>\n\n"
+                         "Всего пользователей: {total}\n"
+                         "Активных за неделю: {weekly}\n"
+                         "Активных за месяц: {monthly}\n"
+                         "Всего сообщений: {messages}")).format(
+                             total=len(all_users), 
+                             weekly=active_weekly, 
+                             monthly=active_monthly, 
+                             messages=total_messages
+                         )
     await message.reply(text)
 
 
-def _parse_ban_args(args: list) -> (timedelta | None, str | None):
-    """Парсит аргументы для команды бана, извлекая длительность и причину."""
-    if not args:
-        return None, None
-
-    duration_str = args[0]
-    reason_args = args[1:]
-
-    duration = None
-    unit = duration_str[-1].lower()
-    value_str = duration_str[:-1]
-
-    if value_str.isdigit():
-        value = int(value_str)
-        if unit in ['y', 'г']:
-            duration = timedelta(days=value * 365)
-        elif unit in ['w', 'н']:
-            duration = timedelta(weeks=value)
-        elif unit in ['d', 'д']:
-            duration = timedelta(days=value)
-        elif unit in ['h', 'ч']:
-            duration = timedelta(hours=value)
-        elif unit in ['m', 'м']:
-            duration = timedelta(minutes=value)
-        else:
-            # Если последний символ не является единицей времени, считаем все аргументы причиной
-            reason_args.insert(0, duration_str)
-
-    else:
-        reason_args.insert(0, duration_str)
-
-    reason = ' '.join(reason_args) if reason_args else None
-    return duration, reason
-
-
+@admin_router.message(Command("ban"))
 async def ban_admin_command(message: Message, bot: Bot):
-    """Обрабатывает команду /ban для блокировки пользователя."""
-    if not await is_admin(message.from_user.id, ADMIN_CHAT_ID, bot):
-        return
-
-    args = message.text.split()[1:]
-    target_user_id = None
-
-    if message.reply_to_message:
-        messages_mapping = load_data(MESSAGES_MAPPING_FILE)
-        target_user_id = messages_mapping.get(str(message.reply_to_message.message_id), {}).get('user_id')
-    elif args and args[0].isdigit():
-        target_user_id = args.pop(0)
-
+    """Блокировка пользователя."""
+    target_user_id, ban_args = await _get_target_id_from_context(message)
     if not target_user_id:
-        await message.reply(
-            MESSAGES.get("ban_usage", "Использование: /ban <user_id> [срок] [причина] или ответом на сообщение."))
+        await message.reply(MESSAGES.get("ban_usage", "Использование: /ban <user_id> [срок] [причина] или ответом на сообщение."))
         return
 
-    users_data = load_data(USERS_DATA_FILE)
-    user_id_str = str(target_user_id)
-    if user_id_str not in users_data:
-        await message.reply(MESSAGES.get("ban_user_not_found", "Пользователь не найден в базе данных."))
+    user_info = users_data.get(target_user_id)
+    if not user_info:
+        await message.reply(MESSAGES.get("user_not_found", "Пользователь не найден."))
         return
 
-    is_banned, ban_until_text = is_user_banned(target_user_id)
+    is_banned, ban_until = check_ban_status_and_unban_if_expired(target_user_id)
     if is_banned:
-        ban_reason = users_data.get(user_id_str, {}).get('ban_reason', 'не указана')
-        await message.reply(
-            MESSAGES.get("user_already_banned",
-                         "Пользователь уже заблокирован.\nПричина: {reason}\nЗаблокирован до: {until}").format(
-                reason=ban_reason, until=ban_until_text)
-        )
+        await message.reply(MESSAGES.get("user_already_banned", "Пользователь уже заблокирован до {until}.").format(until=ban_until))
         return
 
-    ban_duration, reason_str = _parse_ban_args(args)
+    duration, reason = _parse_ban_args(ban_args)
+    ban_end_time = datetime.datetime.now() + duration if duration else datetime.datetime.max
+    user_info['banned_until'] = ban_end_time.isoformat()
+    if reason: user_info['ban_reason'] = reason
+    users_data.set(target_user_id, user_info)
 
-    ban_end_time = datetime.datetime.now() + ban_duration if ban_duration else datetime.datetime.max
-    users_data[user_id_str]['banned_until'] = ban_end_time.isoformat()
-    if reason_str:
-        users_data[user_id_str]['ban_reason'] = reason_str
-    save_data(USERS_DATA_FILE, users_data)
+    duration_text = str(duration) if duration else "навсегда"
+    try:
+        await bot.send_message(target_user_id, MESSAGES.get("user_ban_notification", "Вы были заблокированы на {duration}. Причина: {reason}").format(duration=duration_text, reason=reason or 'не указана'))
+    except TelegramAPIError:
+        pass # Пользователь мог заблокировать бота
 
-    # Формирование сообщения пользователю
-    if ban_duration:
-        user_ban_message = MESSAGES.get("user_ban_message_with_duration",
-                                        "Вы были заблокированы.\nДлительность: {duration}\nПричина: {reason}").format(
-            duration=str(ban_duration),
-            reason=reason_str or "не указана")
-    else:
-        user_ban_message = MESSAGES.get("user_ban_message_permanent",
-                                        "Вы были заблокированы навсегда.\nПричина: {reason}").format(
-            reason=reason_str or "не указана")
+    await message.reply(MESSAGES.get("admin_ban_success", "Пользователь {user_id} успешно заблокирован.").format(user_id=target_user_id))
+    log_admin_action(message.from_user.id, "BAN", f"User {target_user_id}, duration: {duration_text}, reason: {reason or 'N/A'}")
+
+
+@admin_router.message(Command("unban"))
+async def unban_admin_command(message: Message, bot: Bot):
+    """Разблокировка пользователя."""
+    target_user_id, _ = await _get_target_id_from_context(message)
+    if not target_user_id:
+        await message.reply(MESSAGES.get("unban_usage", "Использование: /unban <user_id> или ответом на сообщение."))
+        return
+
+    user_info = users_data.get(target_user_id)
+    if not user_info or 'banned_until' not in user_info:
+        await message.reply(MESSAGES.get("user_not_banned", "Пользователь не заблокирован."))
+        return
+
+    del user_info['banned_until']
+    if 'ban_reason' in user_info: del user_info['ban_reason']
+    users_data.set(target_user_id, user_info)
 
     try:
-        await bot.send_message(target_user_id, user_ban_message)
-    except TelegramAPIError:
-        pass  # Пользователь мог заблокировать бота
+        await bot.send_message(target_user_id, MESSAGES.get("user_unbanned_notification", "Вы были разблокированы администратором."))
+    except TelegramAPIError: pass
 
-    await message.reply(
-        MESSAGES.get("admin_ban_success", "Пользователь с ID {user_id} успешно заблокирован.").format(
-            user_id=target_user_id))
-    log_admin_action(message.from_user.id, "BAN_USER",
-                     f"User {target_user_id} banned. Duration: {str(ban_duration) or 'Permanent'}. Reason: {reason_str or 'Not specified'}")
+    await message.reply(MESSAGES.get("admin_unban_success", "Пользователь {user_id} разблокирован.").format(user_id=target_user_id))
+    log_admin_action(message.from_user.id, "UNBAN", f"User {target_user_id}")
 
 
-async def unban_admin_command(message: Message, bot: Bot):
-    """Обрабатывает команду /unban для разблокировки пользователя."""
-    if not await is_admin(message.from_user.id, ADMIN_CHAT_ID, bot):
-        return
-
-    target_user_id = None
-    if message.reply_to_message:
-        messages_mapping = load_data(MESSAGES_MAPPING_FILE)
-        target_user_id = messages_mapping.get(str(message.reply_to_message.message_id), {}).get('user_id')
-    elif len(message.text.split()) > 1:
-        target_user_id = message.text.split()[1]
-
-    if not target_user_id:
-        await message.reply(
-            MESSAGES.get("unban_usage",
-                         "Не могу определить ID пользователя. Используйте /unban <ID> или ответьте на сообщение."))
-        return
-
-    users_data = load_data(USERS_DATA_FILE)
-    user_id_str = str(target_user_id)
-
-    if user_id_str in users_data and 'banned_until' in users_data[user_id_str]:
-        del users_data[user_id_str]['banned_until']
-        if 'ban_reason' in users_data[user_id_str]:
-            del users_data[user_id_str]['ban_reason']
-        save_data(USERS_DATA_FILE, users_data)
-
-        try:
-            await bot.send_message(target_user_id,
-                                   MESSAGES.get("user_unbanned_message", "Вы были разблокированы."))
-        except TelegramAPIError:
-            pass
-
-        await message.reply(
-            MESSAGES.get("admin_unban_success", "Пользователь с ID {user_id} разблокирован.").format(
-                user_id=target_user_id))
-        log_admin_action(message.from_user.id, "UNBAN_USER", f"User {target_user_id} unbanned.")
-    else:
-        await message.reply(MESSAGES.get("user_not_banned", "Пользователь не был заблокирован."))
-
-
+@admin_router.message(Command("banlist"))
 async def banlist_admin_command(message: Message, bot: Bot):
-    """Обрабатывает команду /banlist для вывода списка забаненных."""
-    if not await is_admin(message.from_user.id, ADMIN_CHAT_ID, bot):
-        return
+    """Отображает список заблокированных пользователей."""
     await _send_banlist_page(message, bot, 1)
 
 
-async def _send_banlist_page(message: Message, bot: Bot, page: int):
+async def _send_banlist_page(m: Union[Message, CallbackQuery], bot: Bot, page: int):
     """Отправляет страницу со списком заблокированных пользователей."""
-    users_data = load_data(USERS_DATA_FILE)
-    banned_users_list = []
-
-    for user_id, user_info in users_data.items():
-        is_banned, ban_until_text = is_user_banned(user_id)
+    banned_users = []
+    for uid, uinfo in users_data.items():
+        is_banned, until = check_ban_status_and_unban_if_expired(int(uid))
         if is_banned:
-            banned_users_list.append({
-                'user_id': user_id,
-                'username': user_info.get('username', 'неизвестный'),
-                'reason': user_info.get('ban_reason', 'не указана'),
-                'until': ban_until_text
-            })
-
-    if not banned_users_list:
-        await message.reply(MESSAGES.get("no_banned_users", "Заблокированных пользователей нет."))
+            banned_users.append({'id': uid, 'uname': uinfo.get('username', 'н/у'), 'reason': uinfo.get('ban_reason', 'н/у'), 'until': until})
+    
+    if not banned_users:
+        text = MESSAGES.get("no_banned_users", "Заблокированных пользователей нет.")
+        if isinstance(m, CallbackQuery): await m.answer(text, show_alert=True)
+        else: await m.reply(text)
         return
 
-    total_users = len(banned_users_list)
-    total_pages = (total_users + PAGE_SIZE - 1) // PAGE_SIZE
+    total_pages = (len(banned_users) + config.page_size - 1) // config.page_size
     page = max(1, min(page, total_pages))
+    paginated = banned_users[(page - 1) * config.page_size : page * config.page_size]
 
-    start_index = (page - 1) * PAGE_SIZE
-    paginated_users = banned_users_list[start_index:start_index + PAGE_SIZE]
+    user_lines = [MESSAGES.get("banned_user_line", "ID: <code>{id}</code> @{uname} - до {until} (Причина: {reason})").format(**u) for u in paginated]
+    text = MESSAGES.get("banned_list_header", "<b>Список заблокированных (стр. {p}/{tp}):</b>\n\n").format(p=page, tp=total_pages) + "\n".join(user_lines)
+    
+    markup = _get_pagination_keyboard(page, total_pages)
 
-    user_lines = [
-        MESSAGES.get("banned_user_template",
-                     "<b>ID:</b> <code>{user_id}</code>\n<b>Username:</b> @{username}\n<b>Причина:</b> {reason}\n<b>До:</b> {until}\n").format(
-            **user)
-        for user in paginated_users
-    ]
-
-    message_text = MESSAGES.get("banned_list_title",
-                                "<b>Список заблокированных (страница {current_page}/{total_pages}):</b>\n").format(
-        current_page=page, total_pages=total_pages) + "\n---\n".join(user_lines)
-
-    # Кнопки пагинации
-    keyboard = []
-    row = []
-    if page > 1:
-        row.append(InlineKeyboardButton(text="<< Назад", callback_data=f"banlist_{page - 1}"))
-    if page < total_pages:
-        row.append(InlineKeyboardButton(text="Вперед >>", callback_data=f"banlist_{page + 1}"))
-    if row:
-        keyboard.append(row)
-
-    reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-    # Если сообщение было изменено, используем edit_text
-    if isinstance(message, types.CallbackQuery):
-        await message.message.edit_text(message_text, reply_markup=reply_markup)
+    if isinstance(m, CallbackQuery):
+        await m.message.edit_text(text, reply_markup=markup)
     else:
-        await message.reply(message_text, reply_markup=reply_markup)
-
-    log_admin_action(message.from_user.id, "GET_BANLIST", f"Page {page}")
-
-
-async def button_handler(callback_query: types.CallbackQuery, bot: Bot):
-    """Обрабатывает нажатия кнопок пагинации."""
-    await callback_query.answer()
-    page = int(callback_query.data.split('_')[1])
-    await _send_banlist_page(callback_query, bot, page)
+        await m.reply(text, reply_markup=markup)
+    
+    log_admin_action(m.from_user.id, "GET_BANLIST", f"Page {page}")
 
 
-# --- Обработчики сообщений ---
+@admin_router.callback_query(BanlistCallback.filter())
+async def banlist_navigation_handler(cq: CallbackQuery, bot: Bot, callback_data: BanlistCallback):
+    """Обрабатывает навигацию по списку заблокированных."""
+    await cq.answer()
+    await _send_banlist_page(cq, bot, callback_data.page)
 
+
+@user_router.message(F.chat.type == 'private')
 async def handle_user_message(message: Message, bot: Bot):
-    """Обрабатывает сообщения от обычных пользователей."""
-    user_id = str(message.chat.id)
-    is_banned, ban_until_text = is_user_banned(int(user_id))
-
+    """Обработка личных сообщений от пользователей."""
+    user_id = message.chat.id
+    is_banned, until = check_ban_status_and_unban_if_expired(user_id)
     if is_banned:
-        users_data = load_data(USERS_DATA_FILE)
-        ban_reason = users_data.get(user_id, {}).get('ban_reason', 'не указана')
-        await message.reply(
-            MESSAGES.get("user_is_banned_message_with_reason",
-                         "Вы заблокированы.\nПричина: {reason}\nДо: {until}").format(
-                reason=ban_reason, until=ban_until_text)
-        )
+        user = users_data.get(user_id)
+        reason = user.get('ban_reason', 'не указана')
+        await message.reply(MESSAGES.get("user_is_banned_message", "Вы заблокированы до {until}. Причина: {reason}.").format(until=until, reason=reason))
         return
 
-    # Обновление статистики пользователя
-    users_data = load_data(USERS_DATA_FILE)
     now = datetime.datetime.now()
-    if user_id in users_data:
-        user_data = users_data[user_id]
-        user_data['total_messages'] = user_data.get('total_messages', 0) + 1
+    user_data = users_data.get(user_id, {})
+    user_data['total_messages'] = user_data.get('total_messages', 0) + 1
+    user_data['last_message_date'] = now.isoformat()
+    users_data.set(user_id, user_data)
 
-        last_message_date = datetime.datetime.fromisoformat(user_data['last_message_date'])
-        if now - last_message_date > timedelta(days=30):
-            user_data['monthly_messages'] = 1
-        else:
-            user_data['monthly_messages'] = user_data.get('monthly_messages', 0) + 1
-
-        if now - last_message_date > timedelta(days=7):
-            user_data['weekly_messages'] = 1
-        else:
-            user_data['weekly_messages'] = user_data.get('weekly_messages', 0) + 1
-
-        user_data['last_message_date'] = now.isoformat()
-        save_data(USERS_DATA_FILE, users_data)
-
-    # Пересылка сообщения администратору
     try:
-        forwarded_message = await bot.forward_message(ADMIN_CHAT_ID, user_id, message.message_id)
-        messages_mapping = load_data(MESSAGES_MAPPING_FILE)
-        messages_mapping[str(forwarded_message.message_id)] = {
-            'user_id': user_id,
-            'user_message_id': message.message_id,
-            'timestamp': now.timestamp()
-        }
-        save_data(MESSAGES_MAPPING_FILE, messages_mapping)
-        cleanup_old_messages()
+        fwded = await bot.forward_message(config.admin_chat_id, user_id, message.message_id)
+        messages_mapping.set(fwded.message_id, {'user_id': user_id, 'user_message_id': message.message_id, 'timestamp': now.timestamp()})
+        cleanup_old_messages_if_needed()
     except TelegramAPIError as e:
         logger.error(f"Не удалось переслать сообщение от {user_id}: {e}")
+        await message.reply(MESSAGES.get("forward_error", "Не удалось доставить сообщение администратору. Пожалуйста, попробуйте позже."))
 
 
+@admin_router.message(F.reply_to_message)
 async def handle_admin_reply(message: Message, bot: Bot):
-    """Обрабатывает ответы администраторов на сообщения пользователей."""
-    if not message.reply_to_message or not await is_admin(message.from_user.id, ADMIN_CHAT_ID, bot):
+    """Обработка ответа администратора на сообщение пользователя."""
+    mapping = messages_mapping.get(message.reply_to_message.message_id)
+    if not mapping:
+        await message.reply(MESSAGES.get("reply_to_unknown", "Не удалось найти исходное сообщение. Возможно, оно слишком старое или это не сообщение от пользователя."))
         return
 
-    messages_mapping = load_data(MESSAGES_MAPPING_FILE)
-    reply_to_message_id = str(message.reply_to_message.message_id)
+    user_id = mapping.get('user_id')
+    try:
+        await bot.copy_message(user_id, message.chat.id, message.message_id)
+        log_admin_action(message.from_user.id, "REPLY", f"To user {user_id}")
+    except TelegramAPIError as e:
+        logger.error(f"Ошибка ответа пользователю {user_id}: {e}")
+        await message.reply(MESSAGES.get("reply_error", "Не удалось отправить ответ. Ошибка: {error}").format(error=e))
 
-    if reply_to_message_id in messages_mapping:
-        user_id = messages_mapping[reply_to_message_id]['user_id']
-        try:
-            await bot.copy_message(user_id, message.chat.id, message.message_id)
-            log_admin_action(message.from_user.id, "REPLY_TO_USER", f"To user {user_id}")
-        except TelegramAPIError as e:
-            await bot.send_message(ADMIN_CHAT_ID, MESSAGES.get("error_sending_reply",
-                                                               "Не удалось отправить ответ пользователю {user_id}. Ошибка: {error}").format(
-                user_id=user_id, error=e))
+
+# --- Middleware для проверки прав администратора ---
+class AdminAuthMiddleware(BaseMiddleware):
+    def __init__(self, admin_chat_id: int):
+        self.admin_chat_id = admin_chat_id
+
+    async def __call__(
+        self, 
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: Union[Message, CallbackQuery],
+        data: Dict[str, Any]
+    ) -> Any:
+        bot = data.get('bot')
+        # Проверяем, что бот есть в данных и пользователь является админом
+        if not bot or not await is_admin(event.from_user.id, self.admin_chat_id, bot):
+            logger.warning(f"Попытка несанкционированного доступа от user_id {event.from_user.id}")
+            if isinstance(event, CallbackQuery):
+                await event.answer("У вас нет прав для этого действия.", show_alert=True)
+            return
+        
+        return await handler(event, data)
 
 
 # --- Запуск бота ---
-
-async def main() -> None:
+async def main():
     """Главная функция для запуска бота."""
-    # Упрощенное создание файлов
-    for file_path in [USERS_DATA_FILE, MESSAGES_MAPPING_FILE, REPLY_MAPPING_FILE, MESSAGES_FILE]:
-        if not os.path.exists(file_path):
-            save_data(file_path, {})
-    if not os.path.exists(LOG_FILE_NAME):
-        open(LOG_FILE_NAME, 'a').close()
-
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = Bot(token=config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
+    
+    # Применяем middleware ко всем обработчикам в admin_router
+    admin_router.message.middleware(AdminAuthMiddleware(config.admin_chat_id))
+    admin_router.callback_query.middleware(AdminAuthMiddleware(config.admin_chat_id))
 
-    # Регистрация обработчиков
-    dp.message.register(start_command, CommandStart())
-    dp.message.register(help_command, Command("help"))
-
-    # Команды администратора
-    admin_filter = F.chat.id == ADMIN_CHAT_ID
-    dp.message.register(msg_admin_command, Command("msg"), admin_filter)
-    dp.message.register(who_admin_command, Command("who"), admin_filter)
-    dp.message.register(stats_admin_command, Command("stats"), admin_filter)
-    dp.message.register(ban_admin_command, Command("ban"), admin_filter)
-    dp.message.register(unban_admin_command, Command("unban"), admin_filter)
-    dp.message.register(banlist_admin_command, Command("banlist"), admin_filter)
-
-    # Обработка сообщений и колбэков
-    dp.message.register(handle_admin_reply, admin_filter, F.reply_to_message)
-    dp.message.register(handle_user_message, F.chat.id != ADMIN_CHAT_ID)
-    dp.callback_query.register(button_handler, F.data.startswith('banlist_'))
+    dp.include_router(admin_router)
+    dp.include_router(user_router)
 
     try:
-        logger.info("Бот запущен.")
+        logger.info("Бот запущен и готов к работе.")
         await dp.start_polling(bot)
     except Exception as e:
-        logger.critical(f"Критическая ошибка при запуске бота: {e}")
+        logger.critical(f"Критическая ошибка при работе бота: {e}", exc_info=True)
+    finally:
+        await bot.session.close()
+        logger.info("Бот остановлен.")
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен вручную.")
