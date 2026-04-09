@@ -26,7 +26,8 @@
 
 1.  **Клонируйте репозиторий:**
     ```sh
-    git clone <URL вашего репозитория>
+    cd /opt
+    git clone https://github.com/Mythological/telegram-support-bot
     cd support-bot
     ```
 
@@ -54,10 +55,59 @@
 
     > **Как узнать ID группы?** Добавьте в группу бота [@userinfobot](https://t.me/userinfobot), и он покажет ID чата.
 
-5.  **Запустите бота:**
+5.  **Запустите бота в ручную:**
     ```sh
     python main.py
     ```
+
+6. **Запустите бота автоматически через systemd:**
+    - Создайте юзера и дайте ему права:
+      ```sh
+       sudo useradd -r -s /bin/bash -m -d /home/telegram_bot telegram_bot
+       sudo chown -R telegram_bot:telegram_bot /opt/telegram-support-bot
+       sudo chmod 640 /opt/telegram-support-bot/.env
+      ```
+     - Если после запуска бота возникнут ошибки на созданную папку ботом
+      ```sh
+       sudo chown -R telegram_bot:telegram_bot /opt/telegram-support-bot/meta
+       sudo chmod 755 /opt/telegram-support-bot/meta
+      ```
+      -
+      ```sh
+       sudo nano /etc/systemd/system/mybot.service
+      ```
+
+```sh
+[Unit]
+Description=Telegram Support Bot (BlaBlaBla)
+After=network.target
+
+[Service]
+User=telegram_bot
+Group=telegram_bot
+WorkingDirectory=/opt/telegram-support-bot
+EnvironmentFile=/opt/telegram-support-bot/.env
+ExecStart=/opt/telegram-support-bot/venv/bin/python /opt/telegram-support-bot/main.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+- Запуск и автозагрузка
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable mybot.service
+sudo systemctl start mybot.service
+sudo systemctl status mybot.service
+```
+
+-- логи
+
+```sh
+sudo journalctl -u mybot.service -n 50
+
+```
 
 ## 📁 Структура файлов
 
