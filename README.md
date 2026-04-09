@@ -77,37 +77,37 @@
        sudo nano /etc/systemd/system/mybot.service
       ```
 
-```sh
-[Unit]
-Description=Telegram Support Bot (BlaBlaBla)
-After=network.target
+    ```sh
+    [Unit]
+    Description=Telegram Support Bot (BlaBlaBla)
+    After=network.target
 
-[Service]
-User=telegram_bot
-Group=telegram_bot
-WorkingDirectory=/opt/telegram-support-bot
-EnvironmentFile=/opt/telegram-support-bot/.env
-ExecStart=/opt/telegram-support-bot/venv/bin/python /opt/telegram-support-bot/main.py
-Restart=always
-RestartSec=10
+    [Service]
+    User=telegram_bot
+    Group=telegram_bot
+    WorkingDirectory=/opt/telegram-support-bot
+    EnvironmentFile=/opt/telegram-support-bot/.env
+    ExecStart=/opt/telegram-support-bot/venv/bin/python /opt/telegram-support-bot/main.py
+    Restart=always
+    RestartSec=10
 
-[Install]
-WantedBy=multi-user.target
-```
-- Запуск и автозагрузка
-```sh
-sudo systemctl daemon-reload
-sudo systemctl enable mybot.service
-sudo systemctl start mybot.service
-sudo systemctl status mybot.service
-```
+    [Install]
+    WantedBy=multi-user.target
+    ```
+    - Запуск и автозагрузка
+    ```sh
+    sudo systemctl daemon-reload
+    sudo systemctl enable mybot.service
+    sudo systemctl start mybot.service
+    sudo systemctl status mybot.service
+    ```
 
--- логи
+    - Логи
 
-```sh
-sudo journalctl -u mybot.service -n 50
+    ```sh
+    sudo journalctl -u mybot.service -n 50
 
-```
+    ```
 
 ## 📁 Структура файлов
 
